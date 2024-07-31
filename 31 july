@@ -1,0 +1,224 @@
+# Install necessary libraries
+!pip install tensorflow tensorflow-hub shap lime pandas scikit-learn matplotlib numpy xgboost
+
+# Import libraries
+import tensorflow as tf
+import tensorflow_hub as hub
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import shap
+import lime
+import lime.lime_image
+from sklearn.metrics import accuracy_score, f1_score, precision_score, confusion_matrix
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.preprocessing import LabelEncoder
+from xgboost import XGBClassifier
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import VGG16, DenseNet121
+from tensorflow.keras.layers import Dense, Flatten, Dropout, Input
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+
+# Set parameters
+img_height, img_width = 150, 150  # Reduced size for faster processing
+batch_size = 32
+num_classes = 18
+
+# Data Generators
+datagen = ImageDataGenerator(rescale=1./255, validation_split=0.2)
+
+train_generator = datagen.flow_from_directory(
+    '/content/drive/MyDrive/SmallLeavesDataset/train',
+    target_size=(img_height, img_width),
+    batch_size=batch_size,
+    class_mode='categorical',
+    shuffle=True,
+    subset='training'
+)
+
+validation_generator = datagen.flow_from_directory(
+    '/content/drive/MyDrive/SmallLeavesDataset/train',
+    target_size=(img_height, img_width),
+    batch_size=batch_size,
+    class_mode='categorical',
+    shuffle=True,
+    subset='validation'
+)
+
+test_generator = datagen.flow_from_directory(
+    '/content/drive/MyDrive/SmallLeavesDataset/test',
+    target_size=(img_height, img_width),
+    batch_size=batch_size,
+    class_mode='categorical',
+    shuffle=False
+)
+
+# Function to evaluate and print model performance
+def evaluate_model(model, test_generator):
+    test_loss, test_accuracy = model.evaluate(test_generator)
+    print(f'Test Accuracy: {test_accuracy}')
+
+    # Predict on test data
+    test_generator.reset()
+    preds = model.predict(test_generator)
+    y_true = test_generator.classes
+    y_pred = np.argmax(preds, axis=1)
+
+    # Calculate metrics
+    accuracy = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average='weighted')
+    precision = precision_score(y_true, y_pred, average='weighted')
+    conf_matrix = confusion_matrix(y_true, y_pred)
+
+    # Print metrics
+    print(f'Accuracy: {accuracy}')
+    print(f'F1 Score: {f1}')
+    print(f'Precision: {precision}')
+    print(f'Confusion Matrix: \n{conf_matrix}')
+
+    return accuracy, f1, precision, conf_matrix
+
+# Function to explain predictions using SHAP and LIME
+def explain_predictions(model, test_generator, img_height, img_width):
+    # SHAP explainability
+    explainer = shap.KernelExplainer(model.predict, train_generator)
+    sample_images, _ = next(train_generator)
+    shap_values = explainer.shap_values(sample_images)
+    shap.image_plot(shap_values, sample_images)
+
+    # LIME explainability
+    explainer = lime.lime_image.LimeImageExplainer()
+    img, label = sample_images[0], np.argmax(train_generator[0][1][0])
+    explanation = explainer.explain_instance(img, model.predict, top_labels=5, hide_color=0, num_samples=1000)
+    temp, mask = explanation.get_image_and_mask(label, positive_only=True, num_features=10, hide_rest=True)
+    plt.imshow(temp)
+    plt.show()
+
+# Hybrid Model 1: ViT + CNN
+print("Training ViT + CNN Model")
+
+base_model = VGG16(input_shape=(img_height, img_width, 3), include_top=False, weights='imagenet')
+x = base_model.output
+x = Flatten()(x)
+x = Dense(512, activation='relu')(x)
+x = Dropout(0.5)(x)
+predictions = Dense(num_classes, activation='softmax')(x)
+model_vit_cnn = Model(inputs=base_model.input, outputs=predictions)
+
+for layer in base_model.layers:
+    layer.trainable = False
+
+model_vit_cnn.compile(optimizer=Adam(lr=1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
+history_vit_cnn = model_vit_cnn.fit(train_generator, epochs=1, validation_data=validation_generator)
+
+# Evaluate ViT + CNN
+accuracy, f1, precision, conf_matrix = evaluate_model(model_vit_cnn, test_generator)
+
+# Explain ViT + CNN predictions
+explain_predictions(model_vit_cnn, test_generator, img_height, img_width)
+
+# Save ViT + CNN model
+model_vit_cnn.save('plant_disease_vit_cnn_model.h5')
+
+# Hybrid Model 2: ViT + XGBoost
+print("Training ViT + XGBoost Model")
+
+base_model = VGG16(input_shape=(img_height, img_width, 3), include_top=False, weights='imagenet')
+x = base_model.output
+x = Flatten()(x)
+model_vit_xgb = Model(inputs=base_model.input, outputs=x)
+
+for layer in base_model.layers:
+    layer.trainable = False
+
+features_train = model_vit_xgb.predict(train_generator)
+features_val = model_vit_xgb.predict(validation_generator)
+
+xgb_model = XGBClassifier()
+xgb_model.fit(features_train, train_generator.classes)
+
+# Evaluate ViT + XGBoost
+features_test = model_vit_xgb.predict(test_generator)
+y_pred_xgb = xgb_model.predict(features_test)
+accuracy_xgb = accuracy_score(test_generator.classes, y_pred_xgb)
+f1_xgb = f1_score(test_generator.classes, y_pred_xgb, average='weighted')
+precision_xgb = precision_score(test_generator.classes, y_pred_xgb, average='weighted')
+conf_matrix_xgb = confusion_matrix(test_generator.classes, y_pred_xgb)
+
+print(f'Accuracy: {accuracy_xgb}')
+print(f'F1 Score: {f1_xgb}')
+print(f'Precision: {precision_xgb}')
+print(f'Confusion Matrix: \n{conf_matrix_xgb}')
+
+# Explain ViT + XGBoost predictions (using LIME for instance-based explanation)
+explain_predictions(model_vit_xgb, test_generator, img_height, img_width)
+
+# Save XGBoost model
+xgb_model.save_model('plant_disease_vit_xgb_model.json')
+
+# Hybrid Model 3: ViT + Random Forest
+print("Training ViT + Random Forest Model")
+
+features_train = model_vit_xgb.predict(train_generator)
+features_val = model_vit_xgb.predict(validation_generator)
+
+rf_model = RandomForestClassifier()
+rf_model.fit(features_train, train_generator.classes)
+
+# Evaluate ViT + Random Forest
+features_test = model_vit_xgb.predict(test_generator)
+y_pred_rf = rf_model.predict(features_test)
+accuracy_rf = accuracy_score(test_generator.classes, y_pred_rf)
+f1_rf = f1_score(test_generator.classes, y_pred_rf, average='weighted')
+precision_rf = precision_score(test_generator.classes, y_pred_rf, average='weighted')
+conf_matrix_rf = confusion_matrix(test_generator.classes, y_pred_rf)
+
+print(f'Accuracy: {accuracy_rf}')
+print(f'F1 Score: {f1_rf}')
+print(f'Precision: {precision_rf}')
+print(f'Confusion Matrix: \n{conf_matrix_rf}')
+
+# Explain ViT + Random Forest predictions
+explain_predictions(model_vit_xgb, test_generator, img_height, img_width)
+
+# Save Random Forest model
+import joblib
+joblib.dump(rf_model, 'plant_disease_vit_rf_model.pkl')
+
+# Hybrid Model 4: ViT + SVM
+print("Training ViT + SVM Model")
+
+features_train = model_vit_xgb.predict(train_generator)
+features_val = model_vit_xgb.predict(validation_generator)
+
+svm_model = SVC(probability=True)
+svm_model.fit(features_train, train_generator.classes)
+
+# Evaluate ViT + SVM
+features_test = model_vit_xgb.predict(test_generator)
+y_pred_svm = svm_model.predict(features_test)
+accuracy_svm = accuracy_score(test_generator.classes, y_pred_svm)
+f1_svm = f1_score(test_generator.classes, y_pred_svm, average='weighted')
+precision_svm = precision_score(test_generator.classes, y_pred_svm, average='weighted')
+conf_matrix_svm = confusion_matrix(test_generator.classes, y_pred_svm)
+
+print(f'Accuracy: {accuracy_svm}')
+print(f'F1 Score: {f1_svm}')
+print(f'Precision: {precision_svm}')
+print(f'Confusion Matrix: \n{conf_matrix_svm}')
+
+# Explain ViT + SVM predictions
+explain_predictions(model_vit_xgb, test_generator, img_height, img_width)
+
+# Save SVM model
+joblib.dump(svm_model, 'plant_disease_vit_svm_model.pkl')
+
+# Hybrid Model 5: ViT + DenseNet
+print("Training ViT + DenseNet Model")
+
+base_model = DenseNet121(input_shape=(img_height, img_width, 3), include_top=False, weights='imagenet')
+x = base_model.output
+x = Flatten()(x)
